@@ -1,0 +1,11 @@
+{
+	"version": 0,
+	"dependencies": [
+		{
+			"importpath": "github.com/drdreyworld/siglistener",
+			"repository": "https://github.com/drdreyworld/siglistener",
+			"revision": "ca6c78f2753515a4090a2d35f1ce29ac5583787b",
+			"branch": "master"
+		}
+	]
+}

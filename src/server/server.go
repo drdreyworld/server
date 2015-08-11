@@ -1,12 +1,13 @@
 package server
 
 import (
+	"errors"
+	"github.com/drdreyworld/siglistener"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"syscall"
 	"time"
 )
@@ -28,57 +29,24 @@ func NewServer() *server {
 type server struct {
 	server   *http.Server
 	listener net.Listener
-	signals  chan os.Signal
-	commands chan int
 	stopchan chan int
 	stopped  bool
 	stopcmd  int
+	siglistener.SigListener
 }
 
 func (self *server) Server() *http.Server {
 	return self.server
 }
 
-func (self *server) Start(gracefulChild bool) {
-	self.signals = make(chan os.Signal, 1)
-	self.commands = make(chan int, 10)
+func (self *server) Start(gracefulChild bool) (err error) {
 	self.stopchan = make(chan int, 1)
-
-	defer close(self.signals)
-	defer close(self.commands)
 	defer close(self.stopchan)
 
-	signal.Notify(self.signals,
-		syscall.SIGUSR1,
-		syscall.SIGUSR2,
-		syscall.SIGQUIT,
-	)
-
-	go func() {
-		for {
-			switch <-self.signals {
-			case syscall.SIGUSR1:
-				self.commands <- CMD_GRACE
-			case syscall.SIGUSR2:
-				self.commands <- CMD_RESTART
-			case syscall.SIGQUIT, syscall.SIGTERM:
-				self.commands <- CMD_STOP
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			switch <-self.commands {
-			case CMD_GRACE:
-				self.Grace()
-			case CMD_RESTART:
-				self.Restart()
-			case CMD_STOP:
-				self.Stop()
-			}
-		}
-	}()
+	self.HandleSignal(syscall.SIGUSR1, CMD_GRACE, func(cmd siglistener.SigCommand) { LogIfError(self.Grace()) })
+	self.HandleSignal(syscall.SIGUSR2, CMD_RESTART, func(cmd siglistener.SigCommand) { LogIfError(self.Restart()) })
+	self.HandleSignal(syscall.SIGQUIT, CMD_STOP, func(cmd siglistener.SigCommand) { LogIfError(self.Stop()) })
+	self.ListenCommands()
 
 	if gracefulChild {
 		f := os.NewFile(3, "")
@@ -87,74 +55,86 @@ func (self *server) Start(gracefulChild bool) {
 		self.listener, err = net.Listen("tcp", self.server.Addr)
 	}
 
-	FatalIfError(err)
-	self.server.Serve(self.listener)
+	if err == nil {
+		self.server.Serve(self.listener)
 
-	switch <-self.stopchan {
-	case CMD_GRACE:
-		time.Sleep(time.Second)
+		switch <-self.stopchan {
+		case CMD_GRACE:
+			time.Sleep(time.Second)
+		}
 	}
+
+	return err
 }
 
-func (self *server) Stop() {
-	if !self.stopped {
+func (self *server) Stop() (err error) {
+	if self.stopped {
+		err = errors.New("Server already stopped")
+	} else {
 		self.stopped = true
 		log.Println("Stop")
-		go func() {
-			self.listener.Close()
+
+		if err = self.listener.Close(); err == nil {
 			self.server = nil
 			self.stopchan <- CMD_STOP
-		}()
+		}
 	}
+	return err
 }
 
-func (self *server) Restart() {
-	if !self.stopped {
+func (self *server) Restart() (err error) {
+	if self.stopped {
+		err = errors.New("Server already stopped")
+	} else {
 		self.stopped = true
 		log.Println("Restart")
-		go func() {
-			self.listener.Close()
+
+		if err = self.listener.Close(); err == nil {
 			args := make([]string, 0, len(os.Args)-1)
 			for _, arg := range os.Args[1:] {
 				if arg != "-grace" {
 					args = append(args, arg)
 				}
 			}
-
 			cmd := exec.Command(os.Args[0], args...)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
-			cmd.Start()
-			self.stopchan <- CMD_RESTART
-		}()
+
+			if err = cmd.Start(); err == nil {
+				self.stopchan <- CMD_RESTART
+			}
+		}
 	}
+	return err
 }
 
-func (self *server) Grace() {
-	if !self.stopped {
+func (self *server) Grace() (err error) {
+	if self.stopped {
+		err = errors.New("Server already stopped")
+	} else {
 		self.stopped = true
 		log.Println("Graceful restart")
-		go func() {
-			self.listener.Close()
-			file, err := self.listener.(*net.TCPListener).File()
-			FatalIfError(err)
 
-			args := make([]string, 0, len(os.Args))
-			for _, arg := range os.Args[1:] {
-				if arg != "-grace" {
-					args = append(args, arg)
+		if err = self.listener.Close(); err == nil {
+			if file, err := self.listener.(*net.TCPListener).File(); err == nil {
+				args := make([]string, 0, len(os.Args))
+				for _, arg := range os.Args[1:] {
+					if arg != "-grace" {
+						args = append(args, arg)
+					}
+				}
+
+				args = append(args, "-grace")
+				cmd := exec.Command(os.Args[0], args...)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				cmd.ExtraFiles = []*os.File{file}
+
+				if err = cmd.Start(); err == nil {
+					self.stopchan <- CMD_GRACE
 				}
 			}
-
-			args = append(args, "-grace")
-			cmd := exec.Command(os.Args[0], args...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			cmd.ExtraFiles = []*os.File{
-				file,
-			}
-			cmd.Start()
-			self.stopchan <- CMD_GRACE
-		}()
+		}
 	}
+	return err
 }
